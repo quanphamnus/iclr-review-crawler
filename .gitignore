@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+snapshots/
+watch_state.json
+watch.log
+crawl.log
+cron.log
+.openreview/
+credentials.json
