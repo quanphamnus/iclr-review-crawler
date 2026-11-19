@@ -248,6 +248,7 @@ def derive_csvs(snap: Path, cfg: dict, log) -> dict:
             for k in extra_cols:
                 v = flat.get(k)
                 row[k] = json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
+            row = {k: (v.replace("\x00", "") if isinstance(v, str) else v) for k, v in row.items()}
             w.writerow(row)
             n += 1
             if rating is not None and forum:

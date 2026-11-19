@@ -1,9 +1,25 @@
-__pycache__/
-*.pyc
-snapshots/
-watch_state.json
-watch.log
-crawl.log
-cron.log
+# secrets
+.env
 .openreview/
 credentials.json
+
+# crawled data (large; see README "Data")
+snapshots/
+papers/
+
+# logs / state / caches
+*.log
+watch_state.json
+__pycache__/
+*.pyc
+
+# --- private analysis (labels about specific papers/reviewers; not for publication) ---
+ICLR2027_ai_slop_*.md
+ICLR2027_harsh_but_one_high.*
+ICLR2027_high_score_*.csv
+ICLR2027_reviews_text_edited_*.csv
+ai_slop_*.csv
+build_dataset_tracker.py
+download_dataset.py
+download_papers.py
+.venv/

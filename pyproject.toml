@@ -1,0 +1,7 @@
+[project]
+name = "openreview-review-snapshotter"
+version = "0.1.0"
+description = "Snapshot and diff public OpenReview reviews of a venue."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["openreview-py>=1.40"]

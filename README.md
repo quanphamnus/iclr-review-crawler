@@ -1,180 +1,122 @@
-# OpenReview review snapshotter (ICLR & friends)
+# OpenReview Review Snapshotter
 
-Chụp lại **toàn bộ review ngay thời điểm chúng được public** (bản v1), rồi về sau
-chụp tiếp bản sau rebuttal và **diff** hai bản để xem review nào bị sửa, điểm nào
-bị thay đổi.
+Take immutable, timestamped snapshots of all public reviews (and optionally
+meta-reviews, decisions and comments) of an OpenReview venue, then diff two
+snapshots to see which reviews were added, removed or edited and how scores moved
+after the rebuttal.
 
-Mỗi lần chạy tạo một snapshot **bất biến**, có timestamp: JSONL thô đúng như API
-trả về, kèm CSV phẳng và `manifest.json` có sha256 từng file + hash nội dung từng
-review (để sau này đối chiếu không cần tin vào `tmdate` của OpenReview).
+- **Immutable snapshots**: raw API JSONL + flat CSVs + a manifest with per-file and per-review SHA-256 hashes, so changes are detected from content rather than `tmdate`.
+- **Resumable**: an interrupted crawl continues from its saved cursor.
+- **Venue-agnostic**: field names (rating, confidence, ...) are read from the venue config, so it is not tied to ICLR 2027.
+- **Fast**: bulk, cursor-paginated queries (~1000 notes/request); a full ICLR crawl takes minutes.
 
----
+## Install
 
-## 0. Tình trạng hiện tại (kiểm tra lúc 2026-11-03)
+Uses [uv](https://docs.astral.sh/uv/) (Python 3.10+):
 
-| Hạng mục | Trạng thái |
+```bash
+uv sync                  # creates .venv and installs dependencies
+```
+
+Commands below use `uv run`; alternatively activate the environment
+(`source .venv/bin/activate`) and call `python` directly.
+Plain pip also works: `pip install -r requirements.txt`.
+
+## Authentication
+
+OpenReview blocks anonymous access to `/notes`, so a (free) OpenReview account is required.
+Put credentials in a `.env` file (git-ignored) and load it before running:
+
+```bash
+printf 'OPENREVIEW_USERNAME=you@example.com\nOPENREVIEW_PASSWORD=your-password\n' > .env
+chmod 600 .env
+set -a; . ./.env; set +a
+```
+
+Never commit credentials. The scripts only read the `OPENREVIEW_*` environment variables.
+
+## Quick start
+
+```bash
+# 1. Check login and whether reviews are public yet (downloads nothing)
+uv run python check_setup.py --venue ICLR.cc/2027/Conference
+
+# 2. Take a snapshot
+uv run python crawl_reviews.py --venue ICLR.cc/2027/Conference --label first-release
+
+# 3. Later (e.g. after the rebuttal), take another one, with comments
+uv run python crawl_reviews.py --venue ICLR.cc/2027/Conference --kinds all --label second
+
+# 4. Compare the two
+uv run python diff_snapshots.py \
+  snapshots/ICLR_cc_2027_Conference/<first-release-dir> \
+  snapshots/ICLR_cc_2027_Conference/<second-dir> \
+  --out diff_out
+```
+
+Resume an interrupted crawl: `uv run python crawl_reviews.py --resume <snapshot-dir>`.
+
+### Auto-snapshot the moment reviews go public
+
+```bash
+nohup uv run python watch_and_crawl.py --venue ICLR.cc/2027/Conference \
+  --interval 300 --followups 24h,7d,21d > /dev/null 2>&1 &
+```
+
+The watcher polls every 5 minutes and fires only when enough reviews are readable
+(`--min-count`, default 50) and at least one is public, so reviews of your own
+papers cannot trigger it early. It then takes a `first-release` snapshot plus the
+follow-ups. Progress is kept in `watch_state.json`; restarts do not duplicate snapshots.
+Use `--once` to run it from cron, or `--notify-cmd` to run a command when done.
+
+## Options (`crawl_reviews.py`)
+
+| Flag | Meaning |
 |---|---|
-| Venue sắp có review | `ICLR.cc/2027/Conference` — ICLR 2027, San Francisco, 23/04/2027 |
-| Invitation `ICLR.cc/2027/Conference/-/Submission` | **đã hết hạn** → vòng nộp bài đã đóng |
-| Invitation `ICLR.cc/2027/Conference/-/Official_Review` | **đã tồn tại nhưng Guest chưa đọc được** → review **chưa** public |
-| `review_name` / `rating` / `confidence` | `Official_Review` / `rating` / `confidence` |
-| `Author_Rebuttal` | chưa được tạo |
+| `--venue` | venue group id (default `ICLR.cc/2027/Conference`) |
+| `--label` | suffix for the snapshot directory |
+| `--kinds` | `review,meta_review,decision` (default) or `all` (adds `comment`, `rebuttal`) |
+| `--resume DIR` | continue an interrupted snapshot |
+| `--limit N` | smoke test: N notes per stream (manifest marked `partial`) |
+| `--skip-submissions` | do not download the papers themselves |
+| `--replies-mode` | `parent` (bulk), `forum` (per-paper), `auto` (default) |
+| `--sleep`, `--page-size` | politeness / paging controls |
+| `--no-gzip`, `--no-csv` | output format |
 
-> ICLR 2026 (Rio) đã diễn ra tháng 4/2026 rồi, nên "ICLR năm nay sắp có review" =
-> **ICLR 2027**. Nếu ý bạn là venue khác, chỉ cần đổi `--venue`, mọi script đều
-> đọc cấu hình venue động (tên field review, rating, các venueid…).
-
-## 1. Bắt buộc: tài khoản OpenReview
-
-OpenReview **đã chặn truy cập vô danh vào `/notes`** (trả về
-`ChallengeRequiredError` — bot challenge). Không có cách lách nào hợp lệ; phải
-dùng token của một tài khoản thật. Tài khoản free, chỉ cần đăng ký là đọc được
-mọi thứ public.
-
-```bash
-export OPENREVIEW_USERNAME='email@cua.ban'
-export OPENREVIEW_PASSWORD='mat-khau'
-```
-
-Hoặc lưu file (chỉ mình đọc được):
-
-```bash
-mkdir -p ~/.openreview && printf '{"username":"email@cua.ban","password":"mat-khau"}' > ~/.openreview/credentials.json && chmod 600 ~/.openreview/credentials.json
-```
-
-## 2. Cài
-
-```bash
-pip install -r requirements.txt
-```
-
-## 3. Kiểm tra trước (không tải gì cả)
-
-```bash
-python3 check_setup.py --venue ICLR.cc/2027/Conference
-```
-
-In ra: login OK chưa, số paper, số review đang thấy được, review đã public chưa,
-và gợi ý lệnh tiếp theo. Dòng `VERDICT` nói rõ "reviews ARE visible" hay chưa.
-
-## 4. Để sẵn, tự chạy ngay khi review mở
-
-```bash
-nohup python3 watch_and_crawl.py \
-  --venue ICLR.cc/2027/Conference \
-  --interval 300 \
-  --followups 24h,7d,21d \
-  > /dev/null 2>&1 &
-```
-
-- Mỗi 5 phút hỏi API: có bao nhiêu review đang đọc được.
-- **Chỉ nổ** khi `>= --min-count` (mặc định 50) review **và** có ít nhất 1 review
-  `readers = everyone`. Nhờ vậy review của chính paper bạn, hoặc review bạn tự
-  viết (bạn thấy sớm hơn mọi người) sẽ **không** làm nó bắn sớm và chụp mất bản
-  thiếu. Muốn bỏ điều kiện public: `--no-require-public`.
-- Nổ xong crawl luôn, snapshot được gắn nhãn `first-release`.
-- `--followups 24h,7d,21d` tự chụp thêm các bản sau để so sánh rebuttal.
-- Tiến độ ghi ở `watch.log` + `watch_state.json`, restart lại không chụp trùng.
-- Muốn chạy bằng cron thay vì tiến trình thường trú:
-
-```bash
-*/5 * * * * cd /duong/dan/iclr-review-crawler && OPENREVIEW_USERNAME=... OPENREVIEW_PASSWORD=... python3 watch_and_crawl.py --once >> cron.log 2>&1
-```
-
-- Gắn thông báo khi xong (Telegram/Slack/mail…):
-
-```bash
-python3 watch_and_crawl.py --notify-cmd 'echo "reviews crawled -> $SNAPSHOT_DIR" | mail -s ICLR you@example.com'
-```
-
-## 5. Hoặc chạy tay khi thấy review đã mở
-
-```bash
-python3 crawl_reviews.py --venue ICLR.cc/2027/Conference --label first-release
-```
-
-Bị ngắt giữa đường (mạng, Ctrl-C, hết pin) thì chạy lại đúng snapshot đó, nó
-tiếp tục từ cursor đã lưu, không tải lại và không trùng note:
-
-```bash
-python3 crawl_reviews.py --resume snapshots/ICLR_cc_2027_Conference/20261120T<...>_first-release
-```
-
-Tuỳ chọn hay dùng:
-
-| Cờ | Ý nghĩa |
-|---|---|
-| `--kinds review,meta_review,decision` | mặc định; `--kinds all` thêm `comment`, `rebuttal` |
-| `--limit 500` | chụp thử 500 note mỗi stream (manifest sẽ ghi `partial: true`) |
-| `--sleep 0.25` | nghỉ giữa các trang, cho lịch sự với server |
-| `--skip-submissions` | không tải paper (mất title/abstract đi kèm) |
-| `--replies-mode` | `parent` (1 query gộp/loại), `forum` (đi theo reply từng paper), `auto` = mặc định |
-| `--no-gzip` | ghi `.jsonl` thường cho dễ `grep` |
-
-## 6. So bản đầu với bản sau rebuttal
-
-```bash
-python3 diff_snapshots.py \
-  snapshots/ICLR_cc_2027_Conference/<...>_first-release \
-  snapshots/ICLR_cc_2027_Conference/<...>_followup-24h
-```
-
-Sinh `diff.json` + `diff.md` trong snapshot sau:
-
-- review **thêm / mất / bị sửa** (so bằng sha256 nội dung, không tin `tmdate`),
-- bảng **điểm thay đổi** (trước → sau, delta, link forum, lên/xuống/trung bình),
-- unified diff từng field text (`weaknesses`, `summary`…) để thấy đúng chỗ reviewer sửa chữ.
-
-## 7. Snapshot có gì
+## Output
 
 ```
-snapshots/ICLR_cc_2027_Conference/20261120T031500Z_first-release/
-├── raw/
-│   ├── submissions.jsonl.gz    # note paper, nguyên văn API
-│   ├── reviews.jsonl.gz        # note review, nguyên văn API  <- bản gốc để lưu trữ
-│   ├── meta_reviews.jsonl.gz
-│   └── decisions.jsonl.gz
-├── reviews.csv        # 1 dòng/review: paper_number, title, reviewer, rating_num,
-│                      # confidence_num, mọi field content, content_sha256, cdate/tmdate...
-├── papers.csv         # 1 dòng/paper: n_reviews, danh sách rating, mean/min/max, link forum
-├── venue_config.json  # cấu hình venue lúc chụp
-├── manifest.json      # số lượng, sha256 từng file, thời gian, ai chụp, tham số đã dùng
-├── _progress.json     # cursor để resume
+snapshots/<venue>/<UTC-timestamp>_<label>/
+├── raw/*.jsonl.gz     # notes exactly as returned by the API (archival copy)
+├── reviews.csv        # one row per review; all content fields, content_sha256
+├── papers.csv         # one row per paper: ratings, mean/min/max, forum URL
+├── venue_config.json  # venue config at snapshot time
+├── manifest.json      # counts, SHA-256 of every file, parameters, timing
 └── crawl.log
 ```
 
-`reviews.csv` sinh cột **động** theo đúng form review của năm đó, nên form ICLR
-2027 có đổi field gì cũng không mất dữ liệu.
+`diff_snapshots.py` writes `diff.json` and `diff.md`: added/removed/edited reviews,
+rating changes (before → after, with direction) and a unified diff of every edited text field.
 
-## 8. Tài nguyên
+## Data
 
-Cách lấy review là **một query gộp** theo `parent_invitations`, phân trang bằng
-cursor 1000 note/request — khoảng **100–150 request** cho cả ICLR (~25k paper,
-~100k review), xong trong vài phút. Nếu API không trả theo cách đó, script tự
-chuyển sang đi theo reply của từng paper (`details=directReplies`).
+This repository contains **code only**. Snapshots are hundreds of MB each
+(`reviews.csv` alone is ~490 MB for ICLR 2027) and are git-ignored; reproduce them
+by running the crawler with your own account.
 
-Chuẩn bị khoảng **1–2 GB** đĩa trống cho một snapshot đầy đủ (raw đã gzip
-~100–200 MB, CSV thêm tương đương).
+Reviews are public but belong to their authors. Check OpenReview's terms and the
+conference policy before redistributing them or training models on them. ICLR is
+double-blind: do not attempt to deanonymize reviewers, and avoid publishing
+labels about specific papers or authors based on unverified review claims.
 
-## 9. Tự kiểm tra (không cần mạng, không cần tài khoản)
+## Tests
 
 ```bash
-python3 selftest.py
+uv run python selftest.py     # offline: fake API with 10k reviews, covers paging, resume, diff, watcher
 ```
 
-Dựng client giả 2.500 paper / 10.000 review rồi chạy thật cả pipeline: phân
-trang nhiều trang, gộp nhiều venueid, stream rỗng, cắt `--limit` + resume không
-trùng/không hở, CSV multi-line, parse `"8: marginal"` → `8.0`, đường dự phòng
-directReplies, 4 ca chặn bắn sớm của watcher, và diff phát hiện đúng số review
-thêm/sửa/đổi điểm. 44 assertion, hiện **pass hết**.
+## Known limitations
 
-## 10. Giới hạn đã biết
-
-- Phải có tài khoản OpenReview (xem mục 1).
-- `--replies-mode forum` chỉ thấy reply **trực tiếp của paper** (review là
-  một), không thấy comment lồng dưới review. Đường mặc định `parent` thì lấy đủ.
-- Review bị **xoá hẳn** giữa hai lần chụp sẽ hiện ở `removed_ids`; OpenReview
-  thường chỉ sửa chứ ít xoá.
-- Chỉ chụp được những gì tài khoản của bạn đọc được. Trước ngày public, bạn chỉ
-  thấy review của paper mình / review mình viết — đó là lý do watcher có chặn
-  `--min-count` + `require-public`.
+- `--replies-mode forum` sees only direct replies of each paper; the default `parent` mode also gets comments nested under reviews.
+- Only what your account can read is captured; before release you see just your own papers/reviews.
+- A review deleted between snapshots appears in `removed_ids` of the diff.
